@@ -88,10 +88,7 @@ function playNextInQueue(guildId: string, serverName: string) {
   if (!pb) return;
 
   if (pb.queue.length === 0) {
-    if (pb.currentTitle) {
-      logger.info(serverName, `Finished playing ${pb.currentTitle}`);
-      pb.currentTitle = undefined;
-    }
+    pb.currentTitle = undefined;
     return;
   }
 
@@ -180,7 +177,12 @@ async function ensureConnectedToMember(
   const channel = member.voice.channel;
   if (!channel) {
     logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: user not in voice)`);
-    await interaction.editReply("Join a voice channel first.");
+    if (interaction.deferred) {
+      await interaction.deleteReply().catch(() => {});
+      await interaction.followUp({ content: "Join a voice channel first.", flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.reply({ content: "Join a voice channel first.", flags: MessageFlags.Ephemeral });
+    }
     return null;
   }
 
@@ -202,12 +204,28 @@ async function ensureConnectedToMember(
       if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
         connection.destroy();
       }
-      await interaction.editReply("Could not connect to your voice channel.");
+      if (interaction.deferred) {
+        await interaction.deleteReply().catch(() => {});
+        await interaction.followUp({ content: "Could not connect to your voice channel.", flags: MessageFlags.Ephemeral });
+      } else {
+        await interaction.reply({ content: "Could not connect to your voice channel.", flags: MessageFlags.Ephemeral });
+      }
       return null;
     }
   } else if (connection.joinConfig.channelId !== channel.id) {
     logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: bot in different channel)`);
-    await interaction.editReply("I am already in another voice channel. Use /dismiss first.");
+    if (interaction.deferred) {
+      await interaction.deleteReply().catch(() => {});
+      await interaction.followUp({
+        content: "I am already in another voice channel. Use /dismiss first.",
+        flags: MessageFlags.Ephemeral,
+      });
+    } else {
+      await interaction.reply({
+        content: "I am already in another voice channel. Use /dismiss first.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
     return null;
   }
 
@@ -358,21 +376,25 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (interaction.commandName === "summon" || interaction.commandName === "join") {
-    await interaction.deferReply();
-
     const member = interaction.member as GuildMember;
     const channel = member.voice.channel;
     if (!channel) {
       logger.warn(server, `${u(user)} used /summon (failed: user not in voice)`);
-      return interaction.editReply("Join a voice channel first.");
+      return interaction.reply({
+        content: "Join a voice channel first.",
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     if (getVoiceConnection(channel.guild.id)) {
       logger.warn(server, `${u(user)} used /summon (failed: bot already connected)`);
-      return interaction.editReply(
-        "I am already connected in this server. Use /dismiss first."
-      );
+      return interaction.reply({
+        content: "I am already connected in this server. Use /dismiss first.",
+        flags: MessageFlags.Ephemeral,
+      });
     }
+
+    await interaction.deferReply();
 
     const connection = joinVoiceChannel({
       channelId: channel.id,
@@ -390,23 +412,30 @@ client.on("interactionCreate", async (interaction) => {
       if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
         connection.destroy();
       }
-      await interaction.editReply("Could not connect to the voice channel.");
+      await interaction.deleteReply().catch(() => {});
+      await interaction.followUp({
+        content: "Could not connect to the voice channel.",
+        flags: MessageFlags.Ephemeral,
+      });
     }
   }
 
   if (interaction.commandName === "quran-play") {
-    await interaction.deferReply();
-
     const targetQuery = interaction.options.getString("target", true);
     const parsed = parseQuranQuery(targetQuery);
 
     if (!parsed.success) {
       logger.warn(server, `${u(user)} used /quran-play (failed: ${parsed.error})`);
-      return interaction.editReply(`❌ ${parsed.error}`);
+      return interaction.reply({
+        content: `❌ ${parsed.error}`,
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     const conn = await ensureConnectedToMember(interaction, server, user);
     if (!conn) return;
+
+    await interaction.deferReply();
 
     const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
     pb.queue = [...parsed.target.items];
@@ -423,8 +452,6 @@ client.on("interactionCreate", async (interaction) => {
     interaction.commandName === "weather-week" ||
     interaction.commandName === "weather"
   ) {
-    await interaction.deferReply();
-
     const conn = await ensureConnectedToMember(interaction, server, user);
     if (!conn) return;
 
@@ -441,8 +468,13 @@ client.on("interactionCreate", async (interaction) => {
 
     if (!weatherResp.success) {
       logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: ${weatherResp.error})`);
-      return interaction.editReply(`❌ ${weatherResp.error}`);
+      return interaction.reply({
+        content: `❌ ${weatherResp.error}`,
+        flags: MessageFlags.Ephemeral,
+      });
     }
+
+    await interaction.deferReply();
 
     const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
     pb.queue = [...weatherResp.result.items];
@@ -484,6 +516,15 @@ client.on("interactionCreate", async (interaction) => {
       logger.warn(server, `${u(user)} used /dismiss (failed: bot not connected)`);
       return interaction.reply({
         content: "I am not in a voice channel.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    const member = interaction.member as GuildMember;
+    if (member?.voice?.channelId && member.voice.channelId !== connection.joinConfig.channelId) {
+      logger.warn(server, `${u(user)} used /dismiss (failed: bot in different channel)`);
+      return interaction.reply({
+        content: "You are not in the same voice channel as the bot.",
         flags: MessageFlags.Ephemeral,
       });
     }
