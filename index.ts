@@ -1,5 +1,8 @@
 import "dotenv/config";
 import { Readable } from "node:stream";
+import dns from "node:dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import {
   Client,
   GatewayIntentBits,
@@ -20,6 +23,7 @@ import {
   VoiceConnection,
 } from "@discordjs/voice";
 import { parseQuranQuery, QuranItem } from "./quran";
+import { getWeatherForecast, PlaybackItem } from "./weather";
 
 const useColor = process.env.NO_COLOR === undefined;
 
@@ -63,10 +67,21 @@ const logger = {
 interface GuildPlayback {
   player: AudioPlayer;
   currentTitle?: string;
-  queue: QuranItem[];
+  queue: (QuranItem | PlaybackItem)[];
 }
 
 const guildPlaybacks = new Map<string, GuildPlayback>();
+
+async function getAudioResourceForItem(item: QuranItem | PlaybackItem) {
+  if ("getStream" in item && typeof item.getStream === "function") {
+    const stream = await item.getStream();
+    return createAudioResource(stream);
+  }
+  if (item.url) {
+    return createAudioResourceFromUrl(item.url);
+  }
+  throw new Error("Invalid playback item: missing url or getStream");
+}
 
 function playNextInQueue(guildId: string, serverName: string) {
   const pb = guildPlaybacks.get(guildId);
@@ -81,7 +96,7 @@ function playNextInQueue(guildId: string, serverName: string) {
   }
 
   const next = pb.queue.shift()!;
-  createAudioResourceFromUrl(next.url)
+  getAudioResourceForItem(next)
     .then((resource) => {
       const currentPb = guildPlaybacks.get(guildId);
       if (!currentPb || !currentPb.currentTitle) return;
@@ -144,12 +159,59 @@ function getOrCreatePlayer(guildId: string, serverName: string, connection: Voic
 }
 
 async function createAudioResourceFromUrl(url: string) {
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    },
+  });
   if (!res.ok || !res.body) {
     throw new Error(`Failed to load audio (${res.status} ${res.statusText})`);
   }
   const stream = Readable.fromWeb(res.body as any);
   return createAudioResource(stream);
+}
+
+async function ensureConnectedToMember(
+  interaction: any,
+  server: string,
+  user: string
+): Promise<{ channel: any; connection: VoiceConnection } | null> {
+  const member = interaction.member as GuildMember;
+  const channel = member.voice.channel;
+  if (!channel) {
+    logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: user not in voice)`);
+    await interaction.editReply("Join a voice channel first.");
+    return null;
+  }
+
+  let connection = getVoiceConnection(interaction.guild.id);
+
+  if (!connection) {
+    connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: channel.guild.id,
+      adapterCreator: channel.guild.voiceAdapterCreator,
+    });
+    attachVoiceListeners(connection, channel.guild.id, server);
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
+    } catch {
+      logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        connection.destroy();
+      }
+      await interaction.editReply("Could not connect to your voice channel.");
+      return null;
+    }
+  } else if (connection.joinConfig.channelId !== channel.id) {
+    logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: bot in different channel)`);
+    await interaction.editReply("I am already in another voice channel. Use /dismiss first.");
+    return null;
+  }
+
+  return { channel, connection };
 }
 
 const client = new Client({
@@ -176,8 +238,48 @@ const commands = [
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
+    .setName("weather-today")
+    .setDescription("Play today's weather forecast in voice (default: Dhaka & Rangpur)")
+    .addStringOption((opt) =>
+      opt
+        .setName("location")
+        .setDescription("City name or zip code (optional, defaults to Dhaka & Rangpur)")
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("weather-week")
+    .setDescription("Play 7-day weekly weather forecast in voice (default: Dhaka & Rangpur)")
+    .addStringOption((opt) =>
+      opt
+        .setName("location")
+        .setDescription("City name or zip code (optional, defaults to Dhaka & Rangpur)")
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("weather")
+    .setDescription("Play weather forecast in voice (default: Dhaka & Rangpur)")
+    .addStringOption((opt) =>
+      opt
+        .setName("timeframe")
+        .setDescription("Forecast timeframe: today or week (default: today)")
+        .setRequired(false)
+        .addChoices(
+          { name: "Today", value: "today" },
+          { name: "Week (7-day)", value: "week" }
+        )
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("location")
+        .setDescription("City name or zip code (optional, defaults to Dhaka & Rangpur)")
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
     .setName("stop")
-    .setDescription("Stop Quran audio playback immediately")
+    .setDescription("Stop audio playback immediately")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ];
 
@@ -266,39 +368,10 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply(`❌ ${parsed.error}`);
     }
 
-    const member = interaction.member as GuildMember;
-    const channel = member.voice.channel;
-    if (!channel) {
-      logger.warn(server, `${u(user)} used /quran-play (failed: user not in voice)`);
-      return interaction.editReply("Join a voice channel first.");
-    }
+    const conn = await ensureConnectedToMember(interaction, server, user);
+    if (!conn) return;
 
-    let connection = getVoiceConnection(interaction.guild.id);
-
-    if (!connection) {
-      connection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-      });
-      attachVoiceListeners(connection, channel.guild.id, server);
-
-      try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-        logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
-      } catch {
-        logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
-        if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-          connection.destroy();
-        }
-        return interaction.editReply("Could not connect to your voice channel.");
-      }
-    } else if (connection.joinConfig.channelId !== channel.id) {
-      logger.warn(server, `${u(user)} used /quran-play (failed: bot in different channel)`);
-      return interaction.editReply("I am already in another voice channel. Use /dismiss first.");
-    }
-
-    const pb = getOrCreatePlayer(interaction.guild.id, server, connection);
+    const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
     pb.queue = [...parsed.target.items];
     pb.currentTitle = parsed.target.title;
 
@@ -306,6 +379,42 @@ client.on("interactionCreate", async (interaction) => {
     playNextInQueue(interaction.guild.id, server);
 
     await interaction.editReply(`▶️ Now playing **${parsed.target.title}** (Mishary Rashid Alafasy)`);
+  }
+
+  if (
+    interaction.commandName === "weather-today" ||
+    interaction.commandName === "weather-week" ||
+    interaction.commandName === "weather"
+  ) {
+    await interaction.deferReply();
+
+    const conn = await ensureConnectedToMember(interaction, server, user);
+    if (!conn) return;
+
+    let timeframe: "today" | "week" = "today";
+    if (interaction.commandName === "weather-week") {
+      timeframe = "week";
+    } else if (interaction.commandName === "weather") {
+      const opt = interaction.options.getString("timeframe");
+      if (opt === "week") timeframe = "week";
+    }
+
+    const locationQuery = interaction.options.getString("location") || undefined;
+    const weatherResp = await getWeatherForecast(timeframe, locationQuery);
+
+    if (!weatherResp.success) {
+      logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: ${weatherResp.error})`);
+      return interaction.editReply(`❌ ${weatherResp.error}`);
+    }
+
+    const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
+    pb.queue = [...weatherResp.result.items];
+    pb.currentTitle = weatherResp.result.title;
+
+    logger.info(server, `Started playing ${weatherResp.result.title} (by ${u(user)})`);
+    playNextInQueue(interaction.guild.id, server);
+
+    await interaction.editReply(weatherResp.result.displayText);
   }
 
   if (interaction.commandName === "stop") {
