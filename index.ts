@@ -23,7 +23,7 @@ import {
   VoiceConnection,
 } from "@discordjs/voice";
 import { parseQuranQuery, QuranItem } from "./quran";
-import { getWeatherForecast, PlaybackItem } from "./weather";
+import { getWeatherForecast, PlaybackItem, createTtsStream } from "./weather";
 
 const useColor = process.env.NO_COLOR === undefined;
 
@@ -302,6 +302,43 @@ client.on("guildCreate", async (guild) => {
     await guild.commands.set(commands);
   } catch (err: any) {
     logger.error(guild.name, `Command sync failed: ${err.message}`);
+  }
+});
+
+client.on("voiceStateUpdate", async (oldState, newState) => {
+  const guild = newState.guild || oldState.guild;
+  if (!guild) return;
+
+  const connection = getVoiceConnection(guild.id);
+  if (!connection) return;
+
+  const botChannelId = connection.joinConfig.channelId;
+  if (!botChannelId) return;
+
+  const member = newState.member || oldState.member;
+  if (!member || member.user.bot) return;
+
+  const userEntered = newState.channelId === botChannelId && oldState.channelId !== botChannelId;
+  const userLeft = oldState.channelId === botChannelId && newState.channelId !== botChannelId;
+
+  if (!userEntered && !userLeft) return;
+
+  const name = member.displayName || member.user.username;
+  const message = userEntered ? `${name} entered the room.` : `${name} left the room.`;
+
+  logger.info(guild.name, `${u(member.user.username)} ${userEntered ? "entered" : "left"} voice channel`);
+
+  const pb = getOrCreatePlayer(guild.id, guild.name, connection);
+  const item: PlaybackItem = {
+    title: message,
+    getStream: () => createTtsStream(message),
+  };
+
+  pb.queue.push(item);
+
+  if (pb.player.state.status === AudioPlayerStatus.Idle) {
+    pb.currentTitle = message;
+    playNextInQueue(guild.id, guild.name);
   }
 });
 
