@@ -236,6 +236,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
+client.on("error", (err) => {
+  logger.error("Discord", `Client error: ${err.message}`);
+});
+
+client.on("warn", (msg) => {
+  logger.warn("Discord", msg);
+});
+
 const commands = [
   new SlashCommandBuilder()
     .setName("summon")
@@ -324,39 +332,43 @@ client.on("guildCreate", async (guild) => {
 });
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
-  const guild = newState.guild || oldState.guild;
-  if (!guild) return;
+  try {
+    const guild = newState.guild || oldState.guild;
+    if (!guild) return;
 
-  const connection = getVoiceConnection(guild.id);
-  if (!connection) return;
+    const connection = getVoiceConnection(guild.id);
+    if (!connection) return;
 
-  const botChannelId = connection.joinConfig.channelId;
-  if (!botChannelId) return;
+    const botChannelId = connection.joinConfig.channelId;
+    if (!botChannelId) return;
 
-  const member = newState.member || oldState.member;
-  if (!member || member.user.bot) return;
+    const member = newState.member || oldState.member;
+    if (!member || member.user.bot) return;
 
-  const userEntered = newState.channelId === botChannelId && oldState.channelId !== botChannelId;
-  const userLeft = oldState.channelId === botChannelId && newState.channelId !== botChannelId;
+    const userEntered = newState.channelId === botChannelId && oldState.channelId !== botChannelId;
+    const userLeft = oldState.channelId === botChannelId && newState.channelId !== botChannelId;
 
-  if (!userEntered && !userLeft) return;
+    if (!userEntered && !userLeft) return;
 
-  const name = member.displayName || member.user.username;
-  const message = userEntered ? `${name} entered the room.` : `${name} left the room.`;
+    const name = member.displayName || member.user.username;
+    const message = userEntered ? `${name} entered the room.` : `${name} left the room.`;
 
-  logger.info(guild.name, `${u(member.user.username)} ${userEntered ? "entered" : "left"} voice channel`);
+    logger.info(guild.name, `${u(member.user.username)} ${userEntered ? "entered" : "left"} voice channel`);
 
-  const pb = getOrCreatePlayer(guild.id, guild.name, connection);
-  const item: PlaybackItem = {
-    title: message,
-    getStream: () => createTtsStream(message),
-  };
+    const pb = getOrCreatePlayer(guild.id, guild.name, connection);
+    const item: PlaybackItem = {
+      title: message,
+      getStream: () => createTtsStream(message),
+    };
 
-  pb.queue.push(item);
+    pb.queue.push(item);
 
-  if (pb.player.state.status === AudioPlayerStatus.Idle) {
-    pb.currentTitle = message;
-    playNextInQueue(guild.id, guild.name);
+    if (pb.player.state.status === AudioPlayerStatus.Idle) {
+      pb.currentTitle = message;
+      playNextInQueue(guild.id, guild.name);
+    }
+  } catch (err: any) {
+    logger.error("Voice", `Voice update error: ${err.message}`);
   }
 });
 
@@ -366,181 +378,223 @@ client.on("interactionCreate", async (interaction) => {
   const server = interaction.guild.name;
   const user = interaction.user.username;
 
-  // Safety net: only admins can use any command
-  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-    logger.warn(server, `${u(user)} used /${interaction.commandName} (denied: admin only)`);
-    return interaction.reply({
-      content: "Only admins can use this command.",
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  if (interaction.commandName === "summon" || interaction.commandName === "join") {
-    const member = interaction.member as GuildMember;
-    const channel = member.voice.channel;
-    if (!channel) {
-      logger.warn(server, `${u(user)} used /summon (failed: user not in voice)`);
-      return interaction.reply({
-        content: "Join a voice channel first.",
+  try {
+    // Safety net: only admins can use any command
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      logger.warn(server, `${u(user)} used /${interaction.commandName} (denied: admin only)`);
+      await interaction.reply({
+        content: "Only admins can use this command.",
         flags: MessageFlags.Ephemeral,
       });
+      return;
     }
 
-    if (getVoiceConnection(channel.guild.id)) {
-      logger.warn(server, `${u(user)} used /summon (failed: bot already connected)`);
-      return interaction.reply({
-        content: "I am already connected in this server. Use /dismiss first.",
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-
-    await interaction.deferReply();
-
-    const connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-    });
-    attachVoiceListeners(connection, channel.guild.id, server);
-
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-      logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
-      await interaction.editReply(`Summoned to ${channel.name}`);
-    } catch {
-      logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
-      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-        connection.destroy();
+    if (interaction.commandName === "summon" || interaction.commandName === "join") {
+      const member = interaction.member as GuildMember;
+      const channel = member.voice.channel;
+      if (!channel) {
+        logger.warn(server, `${u(user)} used /summon (failed: user not in voice)`);
+        await interaction.reply({
+          content: "Join a voice channel first.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
       }
-      await interaction.deleteReply().catch(() => {});
-      await interaction.followUp({
-        content: "Could not connect to the voice channel.",
-        flags: MessageFlags.Ephemeral,
+
+      if (getVoiceConnection(channel.guild.id)) {
+        logger.warn(server, `${u(user)} used /summon (failed: bot already connected)`);
+        await interaction.reply({
+          content: "I am already connected in this server. Use /dismiss first.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.deferReply();
+
+      const connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId: channel.guild.id,
+        adapterCreator: channel.guild.voiceAdapterCreator,
       });
-    }
-  }
+      attachVoiceListeners(connection, channel.guild.id, server);
 
-  if (interaction.commandName === "quran-play") {
-    const targetQuery = interaction.options.getString("target", true);
-    const parsed = parseQuranQuery(targetQuery);
-
-    if (!parsed.success) {
-      logger.warn(server, `${u(user)} used /quran-play (failed: ${parsed.error})`);
-      return interaction.reply({
-        content: `❌ ${parsed.error}`,
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-
-    const conn = await ensureConnectedToMember(interaction, server, user);
-    if (!conn) return;
-
-    await interaction.deferReply();
-
-    const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
-    pb.queue = [...parsed.target.items];
-    pb.currentTitle = parsed.target.title;
-
-    logger.info(server, `Started playing ${parsed.target.title} (by ${u(user)})`);
-    playNextInQueue(interaction.guild.id, server);
-
-    await interaction.editReply(`▶️ Now playing **${parsed.target.title}** (Mishary Rashid Alafasy)`);
-  }
-
-  if (
-    interaction.commandName === "weather-today" ||
-    interaction.commandName === "weather-week" ||
-    interaction.commandName === "weather"
-  ) {
-    const conn = await ensureConnectedToMember(interaction, server, user);
-    if (!conn) return;
-
-    let timeframe: "today" | "week" = "today";
-    if (interaction.commandName === "weather-week") {
-      timeframe = "week";
-    } else if (interaction.commandName === "weather") {
-      const opt = interaction.options.getString("timeframe");
-      if (opt === "week") timeframe = "week";
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+        logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
+        await interaction.editReply(`Summoned to ${channel.name}`);
+      } catch {
+        logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
+        if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+          connection.destroy();
+        }
+        await interaction.deleteReply().catch(() => {});
+        await interaction.followUp({
+          content: "Could not connect to the voice channel.",
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+      return;
     }
 
-    const locationQuery = interaction.options.getString("location") || undefined;
-    const weatherResp = await getWeatherForecast(timeframe, locationQuery);
+    if (interaction.commandName === "quran-play") {
+      const targetQuery = interaction.options.getString("target", true);
+      const parsed = parseQuranQuery(targetQuery);
 
-    if (!weatherResp.success) {
-      logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: ${weatherResp.error})`);
-      return interaction.reply({
-        content: `❌ ${weatherResp.error}`,
-        flags: MessageFlags.Ephemeral,
-      });
+      if (!parsed.success) {
+        logger.warn(server, `${u(user)} used /quran-play (failed: ${parsed.error})`);
+        await interaction.reply({
+          content: `❌ ${parsed.error}`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const conn = await ensureConnectedToMember(interaction, server, user);
+      if (!conn) return;
+
+      await interaction.deferReply();
+
+      const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
+      pb.queue = [...parsed.target.items];
+      pb.currentTitle = parsed.target.title;
+
+      logger.info(server, `Started playing ${parsed.target.title} (by ${u(user)})`);
+      playNextInQueue(interaction.guild.id, server);
+
+      await interaction.editReply(`▶️ Now playing **${parsed.target.title}** (Mishary Rashid Alafasy)`);
+      return;
     }
 
-    await interaction.deferReply();
+    if (
+      interaction.commandName === "weather-today" ||
+      interaction.commandName === "weather-week" ||
+      interaction.commandName === "weather"
+    ) {
+      const conn = await ensureConnectedToMember(interaction, server, user);
+      if (!conn) return;
 
-    const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
-    pb.queue = [...weatherResp.result.items];
-    pb.currentTitle = weatherResp.result.title;
+      let timeframe: "today" | "week" = "today";
+      if (interaction.commandName === "weather-week") {
+        timeframe = "week";
+      } else if (interaction.commandName === "weather") {
+        const opt = interaction.options.getString("timeframe");
+        if (opt === "week") timeframe = "week";
+      }
 
-    logger.info(server, `Started playing ${weatherResp.result.title} (by ${u(user)})`);
-    playNextInQueue(interaction.guild.id, server);
+      const locationQuery = interaction.options.getString("location") || undefined;
+      const weatherResp = await getWeatherForecast(timeframe, locationQuery);
 
-    await interaction.editReply(weatherResp.result.displayText);
-  }
+      if (!weatherResp.success) {
+        logger.warn(server, `${u(user)} used /${interaction.commandName} (failed: ${weatherResp.error})`);
+        await interaction.reply({
+          content: `❌ ${weatherResp.error}`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
 
-  if (interaction.commandName === "stop") {
-    const pb = guildPlaybacks.get(interaction.guild.id);
-    const connection = getVoiceConnection(interaction.guild.id);
+      await interaction.deferReply();
 
-    if (!connection || !pb || (pb.player.state.status === AudioPlayerStatus.Idle && pb.queue.length === 0)) {
-      logger.warn(server, `${u(user)} used /stop (failed: not playing)`);
-      return interaction.reply({
-        content: "No audio is currently playing.",
-        flags: MessageFlags.Ephemeral,
-      });
+      const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
+      pb.queue = [...weatherResp.result.items];
+      pb.currentTitle = weatherResp.result.title;
+
+      logger.info(server, `Started playing ${weatherResp.result.title} (by ${u(user)})`);
+      playNextInQueue(interaction.guild.id, server);
+
+      await interaction.editReply(weatherResp.result.displayText);
+      return;
     }
 
-    pb.queue = [];
-    pb.player.stop(true);
-    const stoppedTitle = pb.currentTitle;
-    pb.currentTitle = undefined;
+    if (interaction.commandName === "stop") {
+      const pb = guildPlaybacks.get(interaction.guild.id);
+      const connection = getVoiceConnection(interaction.guild.id);
 
-    logger.info(server, `Playback stopped (by ${u(user)})`);
-    return interaction.reply({
-      content: `⏹️ Stopped playback${stoppedTitle ? ` of **${stoppedTitle}**` : ""}.`,
-    });
-  }
+      if (!connection || !pb || (pb.player.state.status === AudioPlayerStatus.Idle && pb.queue.length === 0)) {
+        logger.warn(server, `${u(user)} used /stop (failed: not playing)`);
+        await interaction.reply({
+          content: "No audio is currently playing.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
 
-  if (interaction.commandName === "dismiss" || interaction.commandName === "disconnect") {
-    const connection = getVoiceConnection(interaction.guild.id);
-
-    if (!connection) {
-      logger.warn(server, `${u(user)} used /dismiss (failed: bot not connected)`);
-      return interaction.reply({
-        content: "I am not in a voice channel.",
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-
-    const member = interaction.member as GuildMember;
-    if (member?.voice?.channelId && member.voice.channelId !== connection.joinConfig.channelId) {
-      logger.warn(server, `${u(user)} used /dismiss (failed: bot in different channel)`);
-      return interaction.reply({
-        content: "You are not in the same voice channel as the bot.",
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-
-    const pb = guildPlaybacks.get(interaction.guild.id);
-    if (pb) {
       pb.queue = [];
       pb.player.stop(true);
+      const stoppedTitle = pb.currentTitle;
       pb.currentTitle = undefined;
-      guildPlaybacks.delete(interaction.guild.id);
+
+      logger.info(server, `Playback stopped (by ${u(user)})`);
+      await interaction.reply({
+        content: `⏹️ Stopped playback${stoppedTitle ? ` of **${stoppedTitle}**` : ""}.`,
+      });
+      return;
     }
 
-    connection.destroy();
-    logger.info(server, `Dismissed from voice (by ${u(user)})`);
-    await interaction.reply("Dismissed from the voice channel.");
+    if (interaction.commandName === "dismiss" || interaction.commandName === "disconnect") {
+      const connection = getVoiceConnection(interaction.guild.id);
+
+      if (!connection) {
+        logger.warn(server, `${u(user)} used /dismiss (failed: bot not connected)`);
+        await interaction.reply({
+          content: "I am not in a voice channel.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const member = interaction.member as GuildMember;
+      if (member?.voice?.channelId && member.voice.channelId !== connection.joinConfig.channelId) {
+        logger.warn(server, `${u(user)} used /dismiss (failed: bot in different channel)`);
+        await interaction.reply({
+          content: "You are not in the same voice channel as the bot.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const pb = guildPlaybacks.get(interaction.guild.id);
+      if (pb) {
+        pb.queue = [];
+        pb.player.stop(true);
+        pb.currentTitle = undefined;
+        guildPlaybacks.delete(interaction.guild.id);
+      }
+
+      connection.destroy();
+      logger.info(server, `Dismissed from voice (by ${u(user)})`);
+      await interaction.reply("Dismissed from the voice channel.");
+      return;
+    }
+  } catch (err: any) {
+    logger.error(server, `Command /${interaction.commandName} error: ${err.message}`);
+    if (interaction.isRepliable()) {
+      try {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.followUp({
+            content: "An unexpected error occurred while executing this command.",
+            flags: MessageFlags.Ephemeral,
+          });
+        } else {
+          await interaction.reply({
+            content: "An unexpected error occurred while executing this command.",
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+      } catch {
+        // Network socket failed; suppress further cascading errors
+      }
+    }
   }
+});
+
+process.on("unhandledRejection", (err: any) => {
+  logger.error("System", `Unhandled rejection: ${err?.message || err}`);
+});
+
+process.on("uncaughtException", (err: any) => {
+  logger.error("System", `Uncaught exception: ${err?.message || err}`);
 });
 
 client.login(process.env.DISCORD_TOKEN).catch((err: any) => {
