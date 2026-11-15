@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { Readable } from "node:stream";
 import {
   Client,
   GatewayIntentBits,
@@ -12,7 +13,13 @@ import {
   getVoiceConnection,
   entersState,
   VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayer,
+  AudioPlayerStatus,
+  VoiceConnection,
 } from "@discordjs/voice";
+import { parseQuranQuery, QuranItem } from "./quran";
 
 const useColor = process.env.NO_COLOR === undefined;
 
@@ -53,6 +60,98 @@ const logger = {
   error: (server: string, message: string) => log("ERROR", server, message),
 };
 
+interface GuildPlayback {
+  player: AudioPlayer;
+  currentTitle?: string;
+  queue: QuranItem[];
+}
+
+const guildPlaybacks = new Map<string, GuildPlayback>();
+
+function playNextInQueue(guildId: string, serverName: string) {
+  const pb = guildPlaybacks.get(guildId);
+  if (!pb) return;
+
+  if (pb.queue.length === 0) {
+    if (pb.currentTitle) {
+      logger.info(serverName, `Finished playing ${pb.currentTitle}`);
+      pb.currentTitle = undefined;
+    }
+    return;
+  }
+
+  const next = pb.queue.shift()!;
+  createAudioResourceFromUrl(next.url)
+    .then((resource) => {
+      const currentPb = guildPlaybacks.get(guildId);
+      if (!currentPb || !currentPb.currentTitle) return;
+
+      currentPb.player.play(resource);
+    })
+    .catch((err) => {
+      logger.error(serverName, `Failed to load ${next.title}: ${err.message}`);
+      playNextInQueue(guildId, serverName);
+    });
+}
+
+function attachVoiceListeners(connection: VoiceConnection, guildId: string, serverName: string) {
+  connection.on("error", (err) => {
+    logger.error(serverName, `Voice error: ${err.message}`);
+  });
+
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        logger.warn(serverName, "Voice connection dropped");
+        connection.destroy();
+      }
+      const pb = guildPlaybacks.get(guildId);
+      if (pb) {
+        pb.queue = [];
+        pb.player.stop(true);
+        guildPlaybacks.delete(guildId);
+      }
+    }
+  });
+}
+
+function getOrCreatePlayer(guildId: string, serverName: string, connection: VoiceConnection): GuildPlayback {
+  let pb = guildPlaybacks.get(guildId);
+  if (!pb) {
+    const player = createAudioPlayer();
+
+    player.on(AudioPlayerStatus.Idle, () => {
+      playNextInQueue(guildId, serverName);
+    });
+
+    player.on("error", (err) => {
+      logger.error(serverName, `Audio error: ${err.message}`);
+      playNextInQueue(guildId, serverName);
+    });
+
+    connection.subscribe(player);
+    pb = { player, queue: [] };
+    guildPlaybacks.set(guildId, pb);
+  } else {
+    connection.subscribe(pb.player);
+  }
+  return pb;
+}
+
+async function createAudioResourceFromUrl(url: string) {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) {
+    throw new Error(`Failed to load audio (${res.status} ${res.statusText})`);
+  }
+  const stream = Readable.fromWeb(res.body as any);
+  return createAudioResource(stream);
+}
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
@@ -65,6 +164,20 @@ const commands = [
   new SlashCommandBuilder()
     .setName("dismiss")
     .setDescription("Dismiss the bot from the voice channel")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("quran-play")
+    .setDescription("Play a Surah (e.g. 2), Ayah (e.g. 2:34), or Range (e.g. 2:3-6)")
+    .addStringOption((opt) =>
+      opt
+        .setName("target")
+        .setDescription("Surah (e.g. 2), Ayah (e.g. 2:34), or Range (e.g. 2:3-6)")
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop Quran audio playback immediately")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ];
 
@@ -127,24 +240,7 @@ client.on("interactionCreate", async (interaction) => {
       guildId: channel.guild.id,
       adapterCreator: channel.guild.voiceAdapterCreator,
     });
-
-    connection.on("error", (err) => {
-      logger.error(server, `Voice error: ${err.message}`);
-    });
-
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-      } catch {
-        if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-          logger.warn(server, "Voice connection dropped");
-          connection.destroy();
-        }
-      }
-    });
+    attachVoiceListeners(connection, channel.guild.id, server);
 
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
@@ -159,6 +255,82 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
+  if (interaction.commandName === "quran-play") {
+    await interaction.deferReply();
+
+    const targetQuery = interaction.options.getString("target", true);
+    const parsed = parseQuranQuery(targetQuery);
+
+    if (!parsed.success) {
+      logger.warn(server, `${u(user)} used /quran-play (failed: ${parsed.error})`);
+      return interaction.editReply(`❌ ${parsed.error}`);
+    }
+
+    const member = interaction.member as GuildMember;
+    const channel = member.voice.channel;
+    if (!channel) {
+      logger.warn(server, `${u(user)} used /quran-play (failed: user not in voice)`);
+      return interaction.editReply("Join a voice channel first.");
+    }
+
+    let connection = getVoiceConnection(interaction.guild.id);
+
+    if (!connection) {
+      connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId: channel.guild.id,
+        adapterCreator: channel.guild.voiceAdapterCreator,
+      });
+      attachVoiceListeners(connection, channel.guild.id, server);
+
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+        logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
+      } catch {
+        logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
+        if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+          connection.destroy();
+        }
+        return interaction.editReply("Could not connect to your voice channel.");
+      }
+    } else if (connection.joinConfig.channelId !== channel.id) {
+      logger.warn(server, `${u(user)} used /quran-play (failed: bot in different channel)`);
+      return interaction.editReply("I am already in another voice channel. Use /dismiss first.");
+    }
+
+    const pb = getOrCreatePlayer(interaction.guild.id, server, connection);
+    pb.queue = [...parsed.target.items];
+    pb.currentTitle = parsed.target.title;
+
+    logger.info(server, `Started playing ${parsed.target.title} (by ${u(user)})`);
+    playNextInQueue(interaction.guild.id, server);
+
+    await interaction.editReply(`▶️ Now playing **${parsed.target.title}** (Mishary Rashid Alafasy)`);
+  }
+
+  if (interaction.commandName === "stop") {
+    const pb = guildPlaybacks.get(interaction.guild.id);
+    const connection = getVoiceConnection(interaction.guild.id);
+
+    if (!connection || !pb || (pb.player.state.status === AudioPlayerStatus.Idle && pb.queue.length === 0)) {
+      logger.warn(server, `${u(user)} used /stop (failed: not playing)`);
+      return interaction.reply({
+        content: "No audio is currently playing.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    pb.queue = [];
+    pb.player.stop(true);
+    const stoppedTitle = pb.currentTitle;
+    pb.currentTitle = undefined;
+
+    logger.info(server, `Playback stopped (by ${u(user)})`);
+    return interaction.reply({
+      content: `⏹️ Stopped playback${stoppedTitle ? ` of **${stoppedTitle}**` : ""}.`,
+    });
+  }
+
   if (interaction.commandName === "dismiss" || interaction.commandName === "disconnect") {
     const connection = getVoiceConnection(interaction.guild.id);
 
@@ -168,6 +340,14 @@ client.on("interactionCreate", async (interaction) => {
         content: "I am not in a voice channel.",
         flags: MessageFlags.Ephemeral,
       });
+    }
+
+    const pb = guildPlaybacks.get(interaction.guild.id);
+    if (pb) {
+      pb.queue = [];
+      pb.player.stop(true);
+      pb.currentTitle = undefined;
+      guildPlaybacks.delete(interaction.guild.id);
     }
 
     connection.destroy();
