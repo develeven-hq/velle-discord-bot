@@ -658,6 +658,15 @@ export function parseQuranQuery(query: string): ParseResult {
 
       const sPad = String(chapter.id).padStart(3, "0");
       const items: QuranItem[] = [];
+
+      // Prepend Bismillah when starting from ayah 1 (except Al-Fatihah which has it as 1:1, and At-Tawbah which has none)
+      if (startAyah === 1 && chapter.id !== 1 && chapter.id !== 9) {
+        items.push({
+          url: "https://everyayah.com/data/Alafasy_128kbps/001001.mp3",
+          title: "Bismillah ir-Rahman ir-Rahim",
+        });
+      }
+
       for (let a = startAyah; a <= endAyah; a++) {
         const aPad = String(a).padStart(3, "0");
         items.push({
@@ -698,6 +707,18 @@ export function parseQuranQuery(query: string): ParseResult {
     const aPad = String(ayah).padStart(3, "0");
     const title = `Surah ${chapter.name} [${chapter.id}:${ayah}]`;
 
+    const items: QuranItem[] = [];
+    if (ayah === 1 && chapter.id !== 1 && chapter.id !== 9) {
+      items.push({
+        url: "https://everyayah.com/data/Alafasy_128kbps/001001.mp3",
+        title: "Bismillah ir-Rahman ir-Rahim",
+      });
+    }
+    items.push({
+      url: `https://everyayah.com/data/Alafasy_128kbps/${sPad}${aPad}.mp3`,
+      title,
+    });
+
     return {
       success: true,
       target: {
@@ -706,12 +727,7 @@ export function parseQuranQuery(query: string): ParseResult {
         surahName: chapter.name,
         ayah,
         title,
-        items: [
-          {
-            url: `https://everyayah.com/data/Alafasy_128kbps/${sPad}${aPad}.mp3`,
-            title,
-          },
-        ],
+        items,
       },
     };
   }
@@ -724,7 +740,8 @@ export function parseQuranQuery(query: string): ParseResult {
     };
   }
 
-  const url = `https://download.quranicaudio.com/qdc/mishari_al_afasy/murattal/${chapter.id}.mp3`;
+  const sPad = String(chapter.id).padStart(3, "0");
+  const url = `https://cdn.mp3quran.net/audio/mishary-alafasy/r1/${sPad}.mp3`;
   const title = `Surah ${chapter.name} (Full Surah - ${chapter.verses} Ayahs)`;
 
   return {
