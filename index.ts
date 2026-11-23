@@ -379,16 +379,6 @@ client.on("interactionCreate", async (interaction) => {
   const user = interaction.user.username;
 
   try {
-    // Safety net: only admins can use any command
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-      logger.warn(server, `${u(user)} used /${interaction.commandName} (denied: admin only)`);
-      await interaction.reply({
-        content: "Only admins can use this command.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-
     if (interaction.commandName === "summon" || interaction.commandName === "join") {
       const member = interaction.member as GuildMember;
       const channel = member.voice.channel;
