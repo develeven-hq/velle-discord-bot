@@ -8,7 +8,6 @@ import {
   GatewayIntentBits,
   GuildMember,
   MessageFlags,
-  PermissionFlagsBits,
   SlashCommandBuilder,
 } from "discord.js";
 import {
@@ -247,12 +246,10 @@ client.on("warn", (msg) => {
 const commands = [
   new SlashCommandBuilder()
     .setName("summon")
-    .setDescription("Summon the bot to your voice channel")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    .setDescription("Summon the bot to your voice channel"),
   new SlashCommandBuilder()
     .setName("dismiss")
-    .setDescription("Dismiss the bot from the voice channel")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    .setDescription("Dismiss the bot from the voice channel"),
   new SlashCommandBuilder()
     .setName("quran-play")
     .setDescription("Play a Surah (e.g. 2), Ayah (e.g. 2:34), or Range (e.g. 2:3-6)")
@@ -261,8 +258,7 @@ const commands = [
         .setName("target")
         .setDescription("Surah (e.g. 2), Ayah (e.g. 2:34), or Range (e.g. 2:3-6)")
         .setRequired(true)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    ),
   new SlashCommandBuilder()
     .setName("weather-today")
     .setDescription("Play today's weather forecast in voice (default: Dhaka & Rangpur)")
@@ -271,8 +267,7 @@ const commands = [
         .setName("location")
         .setDescription("City name or zip code (optional, defaults to Dhaka & Rangpur)")
         .setRequired(false)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    ),
   new SlashCommandBuilder()
     .setName("weather-week")
     .setDescription("Play 7-day weekly weather forecast in voice (default: Dhaka & Rangpur)")
@@ -281,8 +276,7 @@ const commands = [
         .setName("location")
         .setDescription("City name or zip code (optional, defaults to Dhaka & Rangpur)")
         .setRequired(false)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    ),
   new SlashCommandBuilder()
     .setName("weather")
     .setDescription("Play weather forecast in voice (default: Dhaka & Rangpur)")
@@ -301,12 +295,10 @@ const commands = [
         .setName("location")
         .setDescription("City name or zip code (optional, defaults to Dhaka & Rangpur)")
         .setRequired(false)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    ),
   new SlashCommandBuilder()
     .setName("stop")
-    .setDescription("Stop audio playback immediately")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    .setDescription("Stop audio playback immediately"),
 ];
 
 client.once("clientReady", async (readyClient) => {
