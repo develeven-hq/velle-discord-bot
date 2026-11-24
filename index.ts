@@ -495,7 +495,7 @@ client.on("interactionCreate", async (interaction) => {
       const conn = await ensureConnectedToMember(interaction, server, user);
       if (!conn) return;
 
-      await interaction.deferReply();
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
       const isIdle = pb.player.state.status === AudioPlayerStatus.Idle && !pb.loading;
