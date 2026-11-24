@@ -66,10 +66,22 @@ const logger = {
 interface GuildPlayback {
   player: AudioPlayer;
   currentTitle?: string;
+  queueTitle?: string;
+  loading: boolean;
+  playbackId: number;
   queue: (QuranItem | PlaybackItem)[];
 }
 
 const guildPlaybacks = new Map<string, GuildPlayback>();
+
+function stopPlayback(pb: GuildPlayback) {
+  pb.playbackId++;
+  pb.loading = false;
+  pb.queue = [];
+  pb.queueTitle = undefined;
+  pb.currentTitle = undefined;
+  pb.player.stop(true);
+}
 
 async function getAudioResourceForItem(item: QuranItem | PlaybackItem) {
   if ("getStream" in item && typeof item.getStream === "function") {
@@ -88,18 +100,29 @@ function playNextInQueue(guildId: string, serverName: string) {
 
   if (pb.queue.length === 0) {
     pb.currentTitle = undefined;
+    pb.queueTitle = undefined;
+    pb.loading = false;
     return;
   }
 
   const next = pb.queue.shift()!;
+  const currentPlaybackId = ++pb.playbackId;
+  pb.loading = true;
+  pb.currentTitle = pb.queueTitle ?? next.title;
+
   getAudioResourceForItem(next)
     .then((resource) => {
       const currentPb = guildPlaybacks.get(guildId);
-      if (!currentPb || !currentPb.currentTitle) return;
+      if (!currentPb || currentPb.playbackId !== currentPlaybackId) return;
 
+      currentPb.loading = false;
       currentPb.player.play(resource);
     })
     .catch((err) => {
+      const currentPb = guildPlaybacks.get(guildId);
+      if (!currentPb || currentPb.playbackId !== currentPlaybackId) return;
+
+      currentPb.loading = false;
       logger.error(serverName, `Failed to load ${next.title}: ${err.message}`);
       playNextInQueue(guildId, serverName);
     });
@@ -123,8 +146,7 @@ function attachVoiceListeners(connection: VoiceConnection, guildId: string, serv
       }
       const pb = guildPlaybacks.get(guildId);
       if (pb) {
-        pb.queue = [];
-        pb.player.stop(true);
+        stopPlayback(pb);
         guildPlaybacks.delete(guildId);
       }
     }
@@ -146,7 +168,7 @@ function getOrCreatePlayer(guildId: string, serverName: string, connection: Voic
     });
 
     connection.subscribe(player);
-    pb = { player, queue: [] };
+    pb = { player, loading: false, playbackId: 0, queue: [] };
     guildPlaybacks.set(guildId, pb);
   } else {
     connection.subscribe(pb.player);
@@ -297,6 +319,15 @@ const commands = [
         .setRequired(false)
     ),
   new SlashCommandBuilder()
+    .setName("tts")
+    .setDescription("Say text out loud in the voice channel")
+    .addStringOption((opt) =>
+      opt
+        .setName("text")
+        .setDescription("The text to say out loud")
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
     .setName("stop")
     .setDescription("Stop audio playback immediately"),
 ];
@@ -348,6 +379,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     logger.info(guild.name, `${u(member.user.username)} ${userEntered ? "entered" : "left"} voice channel`);
 
     const pb = getOrCreatePlayer(guild.id, guild.name, connection);
+    const isIdle = pb.player.state.status === AudioPlayerStatus.Idle && !pb.loading;
     const item: PlaybackItem = {
       title: message,
       getStream: () => createTtsStream(message),
@@ -355,8 +387,8 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 
     pb.queue.push(item);
 
-    if (pb.player.state.status === AudioPlayerStatus.Idle) {
-      pb.currentTitle = message;
+    if (isIdle) {
+      pb.queueTitle = undefined;
       playNextInQueue(guild.id, guild.name);
     }
   } catch (err: any) {
@@ -439,12 +471,52 @@ client.on("interactionCreate", async (interaction) => {
 
       const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
       pb.queue = [...parsed.target.items];
+      pb.queueTitle = parsed.target.title;
       pb.currentTitle = parsed.target.title;
 
       logger.info(server, `Started playing ${parsed.target.title} (by ${u(user)})`);
       playNextInQueue(interaction.guild.id, server);
 
       await interaction.editReply(`▶️ Now playing **${parsed.target.title}** (Mishary Rashid Alafasy)`);
+      return;
+    }
+
+    if (interaction.commandName === "tts") {
+      const text = interaction.options.getString("text", true).trim();
+      if (!text) {
+        logger.warn(server, `${u(user)} used /tts (failed: empty text)`);
+        await interaction.reply({
+          content: "❌ Please provide some text to say out loud.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const conn = await ensureConnectedToMember(interaction, server, user);
+      if (!conn) return;
+
+      await interaction.deferReply();
+
+      const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
+      const isIdle = pb.player.state.status === AudioPlayerStatus.Idle && !pb.loading;
+      const title = `TTS: ${text.length > 60 ? `${text.slice(0, 57)}...` : text}`;
+      const displayText = text.length > 1900 ? `${text.slice(0, 1897)}...` : text;
+      const item: PlaybackItem = {
+        title,
+        getStream: () => createTtsStream(text),
+      };
+
+      pb.queue.push(item);
+
+      if (isIdle) {
+        pb.queueTitle = undefined;
+        logger.info(server, `Speaking TTS "${text}" (by ${u(user)})`);
+        playNextInQueue(interaction.guild.id, server);
+        await interaction.editReply(`🗣️ ${displayText}`);
+      } else {
+        logger.info(server, `Queued TTS "${text}" (by ${u(user)})`);
+        await interaction.editReply(`🗣️ Queued: ${displayText}`);
+      }
       return;
     }
 
@@ -480,6 +552,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const pb = getOrCreatePlayer(interaction.guild.id, server, conn.connection);
       pb.queue = [...weatherResp.result.items];
+      pb.queueTitle = weatherResp.result.title;
       pb.currentTitle = weatherResp.result.title;
 
       logger.info(server, `Started playing ${weatherResp.result.title} (by ${u(user)})`);
@@ -493,7 +566,7 @@ client.on("interactionCreate", async (interaction) => {
       const pb = guildPlaybacks.get(interaction.guild.id);
       const connection = getVoiceConnection(interaction.guild.id);
 
-      if (!connection || !pb || (pb.player.state.status === AudioPlayerStatus.Idle && pb.queue.length === 0)) {
+      if (!connection || !pb || (pb.player.state.status === AudioPlayerStatus.Idle && pb.queue.length === 0 && !pb.loading)) {
         logger.warn(server, `${u(user)} used /stop (failed: not playing)`);
         await interaction.reply({
           content: "No audio is currently playing.",
@@ -502,10 +575,8 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      pb.queue = [];
-      pb.player.stop(true);
       const stoppedTitle = pb.currentTitle;
-      pb.currentTitle = undefined;
+      stopPlayback(pb);
 
       logger.info(server, `Playback stopped (by ${u(user)})`);
       await interaction.reply({
@@ -538,9 +609,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const pb = guildPlaybacks.get(interaction.guild.id);
       if (pb) {
-        pb.queue = [];
-        pb.player.stop(true);
-        pb.currentTitle = undefined;
+        stopPlayback(pb);
         guildPlaybacks.delete(interaction.guild.id);
       }
 
