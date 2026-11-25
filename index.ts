@@ -15,6 +15,7 @@ import {
   getVoiceConnection,
   entersState,
   VoiceConnectionStatus,
+  VoiceConnectionDisconnectReason,
   createAudioPlayer,
   createAudioResource,
   AudioPlayer,
@@ -113,7 +114,10 @@ function playNextInQueue(guildId: string, serverName: string) {
   getAudioResourceForItem(next)
     .then((resource) => {
       const currentPb = guildPlaybacks.get(guildId);
-      if (!currentPb || currentPb.playbackId !== currentPlaybackId) return;
+      if (!currentPb || currentPb.playbackId !== currentPlaybackId) {
+        resource.playStream.destroy();
+        return;
+      }
 
       currentPb.loading = false;
       currentPb.player.play(resource);
@@ -128,27 +132,65 @@ function playNextInQueue(guildId: string, serverName: string) {
     });
 }
 
+function cleanupGuildPlayback(guildId: string) {
+  const pb = guildPlaybacks.get(guildId);
+  if (pb) {
+    stopPlayback(pb);
+    guildPlaybacks.delete(guildId);
+  }
+}
+
 function attachVoiceListeners(connection: VoiceConnection, guildId: string, serverName: string) {
   connection.on("error", (err) => {
     logger.error(serverName, `Voice error: ${err.message}`);
   });
 
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+  connection.on(VoiceConnectionStatus.Destroyed, () => {
+    cleanupGuildPlayback(guildId);
+  });
+
+  connection.on(VoiceConnectionStatus.Disconnected, async (_oldState, newState) => {
+    if (newState.reason === VoiceConnectionDisconnectReason.Manual) {
+      return;
+    }
+
     try {
       await Promise.race([
         entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
+      return;
     } catch {
-      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-        logger.warn(serverName, "Voice connection dropped");
-        connection.destroy();
+      if (connection.state.status === VoiceConnectionStatus.Destroyed) return;
+
+      const is4014 =
+        newState.reason === VoiceConnectionDisconnectReason.WebSocketClose &&
+        newState.closeCode === 4014;
+
+      if (!is4014 && connection.rejoinAttempts < 5) {
+        const reasonLabel =
+          newState.reason === VoiceConnectionDisconnectReason.WebSocketClose
+            ? `ws:${newState.closeCode}`
+            : VoiceConnectionDisconnectReason[newState.reason];
+        logger.warn(
+          serverName,
+          `Voice connection interrupted (${reasonLabel}); attempting rejoin (${connection.rejoinAttempts + 1}/5)`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        if (connection.state.status === VoiceConnectionStatus.Disconnected) {
+          connection.rejoin();
+        }
+        return;
       }
-      const pb = guildPlaybacks.get(guildId);
-      if (pb) {
-        stopPlayback(pb);
-        guildPlaybacks.delete(guildId);
-      }
+
+      logger.warn(
+        serverName,
+        is4014
+          ? "Voice connection closed (code 4014); disconnecting"
+          : "Voice connection dropped after rejoin attempts"
+      );
+      connection.destroy();
+      cleanupGuildPlayback(guildId);
     }
   });
 }
@@ -183,6 +225,7 @@ async function createAudioResourceFromUrl(url: string) {
     },
   });
   if (!res.ok || !res.body) {
+    await res.body?.cancel().catch(() => {});
     throw new Error(`Failed to load audio (${res.status} ${res.statusText})`);
   }
   const stream = Readable.fromWeb(res.body as any);
@@ -607,11 +650,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      const pb = guildPlaybacks.get(interaction.guild.id);
-      if (pb) {
-        stopPlayback(pb);
-        guildPlaybacks.delete(interaction.guild.id);
-      }
+      cleanupGuildPlayback(interaction.guild.id);
 
       connection.destroy();
       logger.info(server, `Dismissed from voice (by ${u(user)})`);
