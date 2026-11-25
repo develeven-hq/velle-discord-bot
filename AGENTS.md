@@ -17,7 +17,10 @@ Project conventions and non-obvious constraints for `velle-discord-bot`.
 - **Ephemeral failures & `/tts`**:
   - Precondition failures (not in voice, bot in another channel, invalid input/query, empty `/tts` text) and `/tts` responses must use `flags: MessageFlags.Ephemeral`.
   - If an interaction was already deferred non-ephemerally and then fails (see `ensureConnectedToMember` in `index.ts`), delete the deferred reply first (`await interaction.deleteReply().catch(() => {})`) and send an ephemeral `followUp` — Discord cannot convert a deferred public reply to ephemeral.
-- **Voice connection guard**: Playback commands (`/quran-play`, `/weather*`, `/tts`) must resolve the connection via `ensureConnectedToMember(interaction, server, user)`, which joins the user's channel if disconnected or rejects if the bot is already in another channel.
+- **Voice connection guard & restart persistence**:
+  - Playback commands (`/quran-play`, `/weather*`, `/tts`) must resolve the connection via `ensureConnectedToMember(interaction, server, user)`, which joins the user's channel if disconnected or rejects if the bot is already in another channel.
+  - Joining voice must go through `connectToVoiceChannel`, which persists `{ [guildId]: channelId }` in gitignored `.voice-state.json` (cleared only on `/dismiss`, `guildDelete`, or permanent `Disconnected` drops). On `clientReady`, `rejoinSavedVoiceChannels` takes over the live ghost state (`guild.members.me?.voice.channelId`) or falls back to `.voice-state.json`.
+  - **Do not add a `SIGTERM`/`SIGINT` handler that calls `connection.destroy()` or `client.destroy()`**: abrupt exit on systemd restart intentionally keeps Discord's ghost voice state alive for a few seconds so an empty voice call/streak does not end before the restarted process takes over.
 
 ## Audio Playback & Queue Conventions
 

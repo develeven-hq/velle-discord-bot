@@ -1,4 +1,5 @@
 import "dotenv/config";
+import fs from "node:fs";
 import { Readable } from "node:stream";
 import dns from "node:dns";
 dns.setDefaultResultOrder("ipv4first");
@@ -9,6 +10,7 @@ import {
   GuildMember,
   MessageFlags,
   SlashCommandBuilder,
+  VoiceBasedChannel,
 } from "discord.js";
 import {
   joinVoiceChannel,
@@ -74,6 +76,42 @@ interface GuildPlayback {
 }
 
 const guildPlaybacks = new Map<string, GuildPlayback>();
+const voiceStatePath = new URL("./.voice-state.json", import.meta.url);
+
+function loadVoiceState(): Record<string, string> {
+  try {
+    const raw = fs.readFileSync(voiceStatePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    // Missing or unreadable state file; start empty
+  }
+  return {};
+}
+
+const savedVoiceChannels: Record<string, string> = loadVoiceState();
+
+function persistVoiceState() {
+  try {
+    fs.writeFileSync(voiceStatePath, JSON.stringify(savedVoiceChannels, null, 2));
+  } catch (err: any) {
+    logger.warn("System", `Failed to save voice state: ${err.message}`);
+  }
+}
+
+function saveActiveVoiceChannel(guildId: string, channelId: string) {
+  if (savedVoiceChannels[guildId] === channelId) return;
+  savedVoiceChannels[guildId] = channelId;
+  persistVoiceState();
+}
+
+function clearActiveVoiceChannel(guildId: string) {
+  if (!(guildId in savedVoiceChannels)) return;
+  delete savedVoiceChannels[guildId];
+  persistVoiceState();
+}
 
 function stopPlayback(pb: GuildPlayback) {
   pb.playbackId++;
@@ -189,6 +227,7 @@ function attachVoiceListeners(connection: VoiceConnection, guildId: string, serv
           ? "Voice connection closed (code 4014); disconnecting"
           : "Voice connection dropped after rejoin attempts"
       );
+      clearActiveVoiceChannel(guildId);
       connection.destroy();
       cleanupGuildPlayback(guildId);
     }
@@ -232,6 +271,26 @@ async function createAudioResourceFromUrl(url: string) {
   return createAudioResource(stream);
 }
 
+async function connectToVoiceChannel(channel: VoiceBasedChannel, server: string): Promise<VoiceConnection> {
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: channel.guild.id,
+    adapterCreator: channel.guild.voiceAdapterCreator,
+  });
+  attachVoiceListeners(connection, channel.guild.id, server);
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    saveActiveVoiceChannel(channel.guild.id, channel.id);
+    return connection;
+  } catch (err) {
+    if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      connection.destroy();
+    }
+    throw err;
+  }
+}
+
 async function ensureConnectedToMember(
   interaction: any,
   server: string,
@@ -253,21 +312,11 @@ async function ensureConnectedToMember(
   let connection = getVoiceConnection(interaction.guild.id);
 
   if (!connection) {
-    connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-    });
-    attachVoiceListeners(connection, channel.guild.id, server);
-
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      connection = await connectToVoiceChannel(channel, server);
       logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
     } catch {
       logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
-      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-        connection.destroy();
-      }
       if (interaction.deferred) {
         await interaction.deleteReply().catch(() => {});
         await interaction.followUp({ content: "Could not connect to your voice channel.", flags: MessageFlags.Ephemeral });
@@ -375,8 +424,46 @@ const commands = [
     .setDescription("Stop audio playback immediately"),
 ];
 
+async function rejoinSavedVoiceChannels(readyClient: Client<true>) {
+  for (const guildId of Object.keys(savedVoiceChannels)) {
+    if (!readyClient.guilds.cache.has(guildId)) {
+      clearActiveVoiceChannel(guildId);
+    }
+  }
+
+  for (const guild of readyClient.guilds.cache.values()) {
+    if (getVoiceConnection(guild.id)) continue;
+
+    const liveChannelId = guild.members.me?.voice.channelId ?? undefined;
+    const channelId = liveChannelId ?? savedVoiceChannels[guild.id];
+    if (!channelId) continue;
+
+    const channel =
+      guild.channels.cache.get(channelId) ??
+      (await guild.channels.fetch(channelId).catch(() => null));
+
+    if (!channel || !channel.isVoiceBased()) {
+      logger.warn(guild.name, `Saved voice channel ${channelId} no longer exists; skipping rejoin`);
+      clearActiveVoiceChannel(guild.id);
+      continue;
+    }
+
+    try {
+      await connectToVoiceChannel(channel, guild.name);
+      logger.info(
+        guild.name,
+        `Auto-rejoined #${channel.name} after startup (${liveChannelId ? "ghost takeover" : "saved state"})`
+      );
+    } catch {
+      logger.error(guild.name, `Failed to auto-rejoin #${channel.name} after startup`);
+    }
+  }
+}
+
 client.once("clientReady", async (readyClient) => {
   logger.info("System", `Ready as ${readyClient.user.tag} (${readyClient.guilds.cache.size} guilds)`);
+
+  await rejoinSavedVoiceChannels(readyClient);
 
   for (const guild of readyClient.guilds.cache.values()) {
     try {
@@ -397,6 +484,11 @@ client.on("guildCreate", async (guild) => {
   }
 });
 
+client.on("guildDelete", (guild) => {
+  cleanupGuildPlayback(guild.id);
+  clearActiveVoiceChannel(guild.id);
+});
+
 client.on("voiceStateUpdate", async (oldState, newState) => {
   try {
     const guild = newState.guild || oldState.guild;
@@ -405,11 +497,18 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const connection = getVoiceConnection(guild.id);
     if (!connection) return;
 
+    const member = newState.member || oldState.member;
+    if (!member) return;
+
+    if (member.id === client.user?.id && newState.channelId && newState.channelId !== oldState.channelId) {
+      saveActiveVoiceChannel(guild.id, newState.channelId);
+      return;
+    }
+
     const botChannelId = connection.joinConfig.channelId;
     if (!botChannelId) return;
 
-    const member = newState.member || oldState.member;
-    if (!member || member.user.bot) return;
+    if (member.user.bot) return;
 
     const userEntered = newState.channelId === botChannelId && oldState.channelId !== botChannelId;
     const userLeft = oldState.channelId === botChannelId && newState.channelId !== botChannelId;
@@ -469,22 +568,12 @@ client.on("interactionCreate", async (interaction) => {
 
       await interaction.deferReply();
 
-      const connection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-      });
-      attachVoiceListeners(connection, channel.guild.id, server);
-
       try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+        await connectToVoiceChannel(channel, server);
         logger.info(server, `Connected to #${channel.name} (by ${u(user)})`);
         await interaction.editReply(`Summoned to ${channel.name}`);
       } catch {
         logger.error(server, `Failed to join #${channel.name} (by ${u(user)}: timeout)`);
-        if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-          connection.destroy();
-        }
         await interaction.deleteReply().catch(() => {});
         await interaction.followUp({
           content: "Could not connect to the voice channel.",
@@ -651,6 +740,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       cleanupGuildPlayback(interaction.guild.id);
+      clearActiveVoiceChannel(interaction.guild.id);
 
       connection.destroy();
       logger.info(server, `Dismissed from voice (by ${u(user)})`);

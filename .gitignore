@@ -82,6 +82,7 @@ tmp/
 temp/
 *.tmp
 *.temp
+.voice-state.json
 
 # IDE & Editor Files
 .idea/
